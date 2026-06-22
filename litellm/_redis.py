@@ -100,6 +100,8 @@ def _get_redis_cluster_kwargs(client=None):
         "azure_tenant_id",
         "azure_client_secret",
         "max_connections",
+        "socket_timeout",
+        "socket_connect_timeout",
     }
 
     return available_args
@@ -309,7 +311,7 @@ def get_redis_url_from_environment():
     return f"{redis_protocol}://{auth_part}{os.environ['REDIS_HOST']}:{os.environ['REDIS_PORT']}"
 
 
-def _get_redis_client_logic(**env_overrides):  # noqa: PLR0915
+def _get_redis_client_logic(**env_overrides):
     """
     Common functionality across sync + async redis client implementations
     """
@@ -565,7 +567,7 @@ def get_redis_client(**env_overrides):
     return redis.Redis(**redis_kwargs)
 
 
-def get_redis_async_client(  # noqa: PLR0915
+def get_redis_async_client(
     connection_pool: Optional[async_redis.BlockingConnectionPool] = None,
     **env_overrides,
 ) -> Union[async_redis.Redis, async_redis.RedisCluster]:
