@@ -878,6 +878,194 @@ def test_sync_streaming_bad_request_not_midstream(logging_obj: Logging):
     assert "invalid maxOutputTokens" in str(excinfo.value)
 
 
+def _bedrock_error_event(exception_type: str):
+    """A mocked botocore event-stream error event: status_code is botocore's
+    hard-coded 400, with the real type in the :exception-type header."""
+    event = Mock()
+    event.to_response_dict = Mock(
+        return_value={
+            "status_code": 400,
+            "headers": {
+                ":exception-type": exception_type,
+                ":content-type": "application/json",
+                ":message-type": "exception",
+            },
+            "body": b'{"message":"Bedrock had an internal error."}',
+        }
+    )
+    return event
+
+
+@pytest.mark.asyncio
+async def test_bedrock_midstream_internal_server_error_wraps_for_fallback(
+    logging_obj: Logging,
+):
+    """End-to-end regression for https://github.com/BerriAI/litellm/issues/24608:
+    a Bedrock mid-stream internalServerException event (botocore stamps it 400)
+    must flow through the real decoder, gain its modeled 500 status, and wrap
+    into MidStreamFallbackError so the Router can run streaming fallback.
+
+    Calls the real AWSEventStreamDecoder, so reverting the decoder status fix
+    makes the decoder raise BedrockError(400) and the gate raises BadRequestError
+    directly -> this test fails without the fix."""
+    from litellm.exceptions import MidStreamFallbackError
+    from litellm.llms.bedrock.chat.invoke_handler import AWSEventStreamDecoder
+
+    decoder = AWSEventStreamDecoder(model="anthropic.claude-3-sonnet-20240229-v1:0")
+
+    async def _bedrock_stream():
+        decoder._parse_message_from_event(
+            _bedrock_error_event("internalServerException")
+        )
+        yield  # unreachable; the line above raises
+
+    async def _make_call(**kwargs):
+        return _bedrock_stream()
+
+    response = CustomStreamWrapper(
+        completion_stream=None,
+        model="anthropic.claude-3-sonnet-20240229-v1:0",
+        logging_obj=logging_obj,
+        custom_llm_provider="bedrock",
+        make_call=_make_call,
+    )
+
+    with pytest.raises(MidStreamFallbackError):
+        await response.__anext__()
+
+
+@pytest.mark.asyncio
+async def test_bedrock_5xx_wraps_for_midstream_fallback(logging_obj: Logging):
+    """Gate contract: a Bedrock 5xx (here 503 serviceUnavailableException) wraps
+    into MidStreamFallbackError so the Router can run streaming fallback."""
+    from litellm.exceptions import MidStreamFallbackError
+    from litellm.llms.bedrock.chat.invoke_handler import BedrockError
+
+    async def _raise_503(**kwargs):
+        raise BedrockError(
+            status_code=503,
+            message="serviceUnavailableException Bedrock is unavailable.",
+        )
+
+    response = CustomStreamWrapper(
+        completion_stream=None,
+        model="anthropic.claude-3-sonnet-20240229-v1:0",
+        logging_obj=logging_obj,
+        custom_llm_provider="bedrock",
+        make_call=_raise_503,
+    )
+
+    with pytest.raises(MidStreamFallbackError):
+        await response.__anext__()
+
+
+@pytest.mark.asyncio
+async def test_bedrock_validation_error_raises_directly(logging_obj: Logging):
+    """Gate contract: a Bedrock validationException (400) is a client error and
+    must surface directly, never wrapped into MidStreamFallbackError."""
+    from litellm.exceptions import MidStreamFallbackError
+    from litellm.llms.bedrock.chat.invoke_handler import BedrockError
+
+    async def _raise_400(**kwargs):
+        raise BedrockError(
+            status_code=400,
+            message="validationException malformed input.",
+        )
+
+    response = CustomStreamWrapper(
+        completion_stream=None,
+        model="anthropic.claude-3-sonnet-20240229-v1:0",
+        logging_obj=logging_obj,
+        custom_llm_provider="bedrock",
+        make_call=_raise_400,
+    )
+
+    with pytest.raises(Exception) as excinfo:
+        await response.__anext__()
+    assert not isinstance(excinfo.value, MidStreamFallbackError)
+    assert getattr(excinfo.value, "status_code", None) == 400
+
+
+def _hosted_vllm_stream_wrapper(logging_obj: Logging, error_payload: dict) -> CustomStreamWrapper:
+    """A CustomStreamWrapper over the real OpenAI-compatible line iterator,
+    fed an HTTP 200 SSE body that carries an in-body error payload the way
+    vLLM/sglang emit it."""
+    from litellm.llms.openai.chat.gpt_transformation import (
+        OpenAIChatCompletionStreamingHandler,
+    )
+
+    async def _stream():
+        yield f"data: {json.dumps(error_payload)}"
+        yield "data: [DONE]"
+
+    completion_stream = OpenAIChatCompletionStreamingHandler(
+        streaming_response=_stream(), sync_stream=False
+    )
+    return CustomStreamWrapper(
+        completion_stream=completion_stream,
+        model="qwen-vl",
+        logging_obj=logging_obj,
+        custom_llm_provider="hosted_vllm",
+    )
+
+
+@pytest.mark.asyncio
+async def test_in_body_stream_error_400_raises_bad_request(logging_obj: Logging):
+    """Regression for https://github.com/BerriAI/litellm/issues/25492: a 400
+    error returned inside a 200 SSE body must surface as BadRequestError with
+    the provider's message, not be parsed as an empty chunk that silently
+    ends the stream (and never as an internal MidStreamFallbackError)."""
+    from litellm.exceptions import MidStreamFallbackError
+
+    response = _hosted_vllm_stream_wrapper(
+        logging_obj,
+        {
+            "error": {
+                "object": "error",
+                "message": "The model is not multimodal. Please remove image inputs.",
+                "type": "BadRequestError",
+                "param": None,
+                "code": 400,
+            }
+        },
+    )
+
+    with pytest.raises(litellm.BadRequestError) as excinfo:
+        await response.__anext__()
+
+    assert not isinstance(excinfo.value, MidStreamFallbackError)
+    assert excinfo.value.status_code == 400
+    assert "not multimodal" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_in_body_stream_error_500_wraps_for_midstream_fallback(
+    logging_obj: Logging,
+):
+    """An in-body 5xx error wraps into MidStreamFallbackError so the Router's
+    FallbackStreamWrapper can switch to a configured fallback deployment."""
+    from litellm.exceptions import MidStreamFallbackError
+
+    response = _hosted_vllm_stream_wrapper(
+        logging_obj,
+        {
+            "error": {
+                "object": "error",
+                "message": "internal engine crash",
+                "type": "InternalServerError",
+                "param": None,
+                "code": 500,
+            }
+        },
+    )
+
+    with pytest.raises(MidStreamFallbackError) as excinfo:
+        await response.__anext__()
+
+    assert excinfo.value.is_pre_first_chunk is True
+    assert "internal engine crash" in str(excinfo.value)
+
+
 @pytest.mark.asyncio
 async def test_async_streaming_read_timeout_triggers_midstream_fallback(
     logging_obj: Logging,
@@ -1203,6 +1391,190 @@ def test_has_any_special_delta_attributes(
         regular_delta
     )
     assert result is False
+
+
+def test_calculate_total_usage_with_cost():
+    from litellm.litellm_core_utils.streaming_handler import calculate_total_usage
+
+    chunk1_usage = Usage(completion_tokens=1, prompt_tokens=10, total_tokens=11)
+    chunk1 = ModelResponseStream(
+        id="test-1",
+        created=1745513206,
+        model="openrouter/test",
+        choices=[
+            StreamingChoices(finish_reason=None, index=0, delta=Delta(content="Hi"))
+        ],
+        usage=chunk1_usage,
+    )
+
+    chunk2_usage = Usage(
+        completion_tokens=5, prompt_tokens=10, total_tokens=15, cost=0.00025
+    )
+    chunk2 = ModelResponseStream(
+        id="test-1",
+        created=1745513207,
+        model="openrouter/test",
+        choices=[
+            StreamingChoices(finish_reason="stop", index=0, delta=Delta(content=""))
+        ],
+        usage=chunk2_usage,
+    )
+
+    usage = calculate_total_usage([chunk1, chunk2])
+
+    assert hasattr(usage, "cost")
+    assert usage.cost == 0.00025
+    assert usage.prompt_tokens == 10
+    assert usage.completion_tokens == 5
+
+
+def test_calculate_total_usage_with_dict_usage_cost():
+    """Regression: dict-shaped `usage` with a `cost` key must still surface
+    provider cost even though `hasattr` on a dict does not consult its keys."""
+    from litellm.litellm_core_utils.streaming_handler import calculate_total_usage
+
+    chunk = {
+        "usage": {
+            "prompt_tokens": 10,
+            "completion_tokens": 5,
+            "total_tokens": 15,
+            "cost": 0.00025,
+        }
+    }
+
+    usage = calculate_total_usage([chunk])
+
+    assert usage.prompt_tokens == 10
+    assert usage.completion_tokens == 5
+    assert getattr(usage, "cost", None) == 0.00025
+
+
+@pytest.mark.asyncio
+async def test_openrouter_streaming_cost_after_finish_reason(logging_obj: Logging):
+    from litellm.utils import ModelResponseListIterator
+
+    chunk1 = ModelResponseStream(
+        id="chatcmpl-or",
+        created=1742056047,
+        model="openrouter/claude",
+        choices=[
+            StreamingChoices(
+                finish_reason=None, index=0, delta=Delta(content="Hi", role="assistant")
+            )
+        ],
+        usage=None,
+    )
+    chunk2 = ModelResponseStream(
+        id="chatcmpl-or",
+        created=1742056048,
+        model="openrouter/claude",
+        choices=[
+            StreamingChoices(finish_reason="stop", index=0, delta=Delta(content=""))
+        ],
+        usage=None,
+    )
+    chunk3_usage = Usage(
+        completion_tokens=5, prompt_tokens=10, total_tokens=15, cost=0.00025
+    )
+    chunk3 = ModelResponseStream(
+        id="chatcmpl-or",
+        created=1742056049,
+        model="openrouter/claude",
+        choices=[
+            StreamingChoices(finish_reason=None, index=0, delta=Delta(content=""))
+        ],
+        usage=chunk3_usage,
+    )
+
+    completion_stream = ModelResponseListIterator(
+        model_responses=[chunk1, chunk2, chunk3]
+    )
+    response = CustomStreamWrapper(
+        completion_stream=completion_stream,
+        model="openrouter/claude",
+        custom_llm_provider="openrouter",
+        logging_obj=logging_obj,
+        stream_options={"include_usage": True},
+    )
+
+    collected_chunks = []
+    async for chunk in response:
+        collected_chunks.append(chunk)
+
+    usage_chunks = [c for c in collected_chunks if hasattr(c, "usage") and c.usage]
+    assert len(usage_chunks) > 0
+    assert hasattr(usage_chunks[-1].usage, "cost")
+    assert usage_chunks[-1].usage.cost == 0.00025
+
+
+def test_openrouter_streaming_cost_propagates_to_hidden_params():
+    """
+    Verify that provider-reported cost from usage.cost flows into
+    _hidden_params["additional_headers"]["llm_provider-x-litellm-response-cost"]
+    on the complete streaming response, so litellm's cost calculator uses it.
+    """
+    import litellm
+
+    chunk1 = ModelResponseStream(
+        id="chatcmpl-or",
+        created=1742056047,
+        model="openrouter/claude",
+        choices=[
+            StreamingChoices(
+                finish_reason=None, index=0, delta=Delta(content="Hi", role="assistant")
+            )
+        ],
+        usage=None,
+    )
+    chunk2 = ModelResponseStream(
+        id="chatcmpl-or",
+        created=1742056048,
+        model="openrouter/claude",
+        choices=[
+            StreamingChoices(finish_reason="stop", index=0, delta=Delta(content=""))
+        ],
+        usage=None,
+    )
+    chunk3 = ModelResponseStream(
+        id="chatcmpl-or",
+        created=1742056049,
+        model="openrouter/claude",
+        choices=[
+            StreamingChoices(finish_reason=None, index=0, delta=Delta(content=""))
+        ],
+        usage=Usage(
+            completion_tokens=5, prompt_tokens=10, total_tokens=15, cost=0.00025
+        ),
+    )
+
+    # Build the complete response as stream_chunk_builder does
+    complete_response = litellm.stream_chunk_builder(
+        chunks=[chunk1, chunk2, chunk3],
+        messages=[{"role": "user", "content": "test"}],
+    )
+
+    assert complete_response is not None
+    assert hasattr(complete_response.usage, "cost")
+    assert complete_response.usage.cost == 0.00025
+
+    # Use the real propagation method from CustomStreamWrapper
+    CustomStreamWrapper._propagate_usage_cost_to_hidden_params(complete_response)
+
+    assert "additional_headers" in complete_response._hidden_params
+    assert (
+        complete_response._hidden_params["additional_headers"][
+            "llm_provider-x-litellm-response-cost"
+        ]
+        == 0.00025
+    )
+
+    # Verify the cost calculator would pick this up
+    from litellm.cost_calculator import get_response_cost_from_hidden_params
+
+    provider_cost = get_response_cost_from_hidden_params(
+        complete_response._hidden_params
+    )
+    assert provider_cost == 0.00025
 
 
 def test_handle_special_delta_attributes(
@@ -2646,7 +3018,9 @@ def test_chunk_creator_tool_calls_not_dropped_on_finish(
                     tool_calls=[
                         ChatCompletionDeltaToolCall(
                             id="call_abc",
-                            function=Function(name="get_weather", arguments='{"city":"NYC"}'),
+                            function=Function(
+                                name="get_weather", arguments='{"city":"NYC"}'
+                            ),
                             type="function",
                             index=0,
                         )
@@ -2741,3 +3115,243 @@ def test_record_partial_usage_for_failure_noop_without_chunks():
     wrapper._record_partial_usage_for_failure()
 
     assert "combined_usage_object" not in logging_obj.model_call_details
+
+
+@pytest.mark.parametrize("sync_mode", [True, False])
+@pytest.mark.asyncio
+async def test_stream_chunk_builder_raise_at_end_of_stream_still_recovers_usage(
+    sync_mode,
+):
+    """stream_chunk_builder re-raises (as APIError) on large agentic tool-use
+    streams. That raise originates inside the except-StopIteration handler, so
+    before the fix it escaped __next__/__anext__ and the request was dropped from
+    SpendLogs while the provider billed the tokens. The wrapper must catch it and
+    recover usage from the raw chunks so cost is still tracked."""
+    final_usage_block = Usage(
+        completion_tokens=392, prompt_tokens=1799, total_tokens=2191
+    )
+    final_chunk = ModelResponseStream(
+        id="chatcmpl-raise-test",
+        created=1742056047,
+        model=None,
+        object="chat.completion.chunk",
+        choices=[
+            StreamingChoices(
+                finish_reason="stop",
+                index=0,
+                delta=Delta(content="", role="assistant"),
+            )
+        ],
+        usage=final_usage_block,
+    )
+    test_chunks = bedrock_chunks + [final_chunk]
+
+    logging_obj = Logging(
+        model="bedrock/claude-haiku-4-5-20251001-v1:0",
+        messages=[{"role": "user", "content": "Hey"}],
+        stream=True,
+        call_type="completion",
+        start_time=time.time(),
+        litellm_call_id="raise-test",
+        function_id="1245",
+    )
+
+    response = CustomStreamWrapper(
+        completion_stream=ModelResponseListIterator(model_responses=test_chunks),
+        model="bedrock/claude-haiku-4-5-20251001-v1:0",
+        custom_llm_provider="bedrock",
+        logging_obj=logging_obj,
+        stream_options={"include_usage": True},
+    )
+
+    seen_usage = []
+    with patch.object(
+        litellm,
+        "stream_chunk_builder",
+        side_effect=Exception("simulated assembly failure"),
+    ):
+        # before the fix this raised and dropped the request; it must not raise now
+        if sync_mode:
+            for chunk in response:
+                if getattr(chunk, "usage", None) is not None:
+                    seen_usage.append(chunk.usage)
+        else:
+            async for chunk in response:
+                if getattr(chunk, "usage", None) is not None:
+                    seen_usage.append(chunk.usage)
+
+    assert any(
+        u.total_tokens == final_usage_block.total_tokens for u in seen_usage
+    ), "usage recovered from raw chunks was not emitted after stream_chunk_builder raised"
+
+
+@pytest.mark.parametrize("sync_mode", [True, False])
+@pytest.mark.asyncio
+async def test_stream_chunk_builder_raise_and_usage_recovery_failure_does_not_crash(
+    sync_mode,
+):
+    """If end-of-stream assembly raises AND best-effort usage recovery from the raw
+    chunks also fails, the stream must still complete cleanly rather than propagate
+    the exception to the consumer."""
+    from litellm.litellm_core_utils import streaming_handler as sh_module
+
+    final_chunk = ModelResponseStream(
+        id="chatcmpl-raise-recover-fail",
+        created=1742056047,
+        model=None,
+        object="chat.completion.chunk",
+        choices=[
+            StreamingChoices(
+                finish_reason="stop",
+                index=0,
+                delta=Delta(content="", role="assistant"),
+            )
+        ],
+        usage=Usage(completion_tokens=1, prompt_tokens=1, total_tokens=2),
+    )
+
+    response = CustomStreamWrapper(
+        completion_stream=ModelResponseListIterator(
+            model_responses=bedrock_chunks + [final_chunk]
+        ),
+        model="bedrock/claude-haiku-4-5-20251001-v1:0",
+        custom_llm_provider="bedrock",
+        logging_obj=Logging(
+            model="bedrock/claude-haiku-4-5-20251001-v1:0",
+            messages=[{"role": "user", "content": "Hey"}],
+            stream=True,
+            call_type="completion",
+            start_time=time.time(),
+            litellm_call_id="raise-recover-fail",
+            function_id="1245",
+        ),
+        stream_options={"include_usage": True},
+    )
+
+    with (
+        patch.object(
+            litellm, "stream_chunk_builder", side_effect=Exception("assembly failed")
+        ),
+        patch.object(
+            sh_module, "calculate_total_usage", side_effect=Exception("recovery failed")
+        ),
+    ):
+        # must not raise even though both assembly and recovery fail
+        if sync_mode:
+            chunks = [c for c in response]
+        else:
+            chunks = [c async for c in response]
+
+    assert len(chunks) > 0
+
+
+class TransportErrorAfterChunksIterator:
+    """Yields the given chunks, then raises the given exception once, then StopAsyncIteration."""
+
+    def __init__(self, model_responses, exception):
+        self.model_responses = model_responses
+        self.exception = exception
+        self.index = 0
+        self.raised = False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if self.index < len(self.model_responses):
+            chunk = self.model_responses[self.index]
+            self.index += 1
+            return chunk
+        if not self.raised:
+            self.raised = True
+            raise self.exception
+        raise StopAsyncIteration
+
+
+def _reset_test_chunk(content: Optional[str] = None, finish_reason: Optional[str] = None) -> ModelResponseStream:
+    return ModelResponseStream(
+        id="chatcmpl-reset-test",
+        created=1783458104,
+        model="stub-model",
+        object="chat.completion.chunk",
+        choices=[
+            StreamingChoices(
+                index=0,
+                delta=Delta(content=content),
+                finish_reason=finish_reason,
+            )
+        ],
+    )
+
+
+@pytest.mark.asyncio
+async def test_transport_read_error_after_finish_reason_ends_stream_gracefully(
+    logging_obj: Logging,
+):
+    """A trailing connection reset after the provider's finish chunk must not fail the stream."""
+    import httpx
+
+    completion_stream = TransportErrorAfterChunksIterator(
+        model_responses=[
+            _reset_test_chunk(content="Hello"),
+            _reset_test_chunk(finish_reason="stop"),
+        ],
+        exception=httpx.ReadError("Response payload is not completed"),
+    )
+    response = CustomStreamWrapper(
+        completion_stream=completion_stream,
+        model="hosted_vllm/stub-model",
+        custom_llm_provider="hosted_vllm",
+        logging_obj=logging_obj,
+    )
+
+    chunks = [chunk async for chunk in response]
+
+    finish_reasons = [
+        chunk.choices[0].finish_reason
+        for chunk in chunks
+        if chunk.choices and chunk.choices[0].finish_reason
+    ]
+    contents = [
+        chunk.choices[0].delta.content
+        for chunk in chunks
+        if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content
+    ]
+    assert finish_reasons == ["stop"]
+    assert contents == ["Hello"]
+
+
+@pytest.mark.asyncio
+async def test_transport_read_error_before_finish_reason_raises(logging_obj: Logging):
+    """A connection reset before any finish chunk must surface, never end as a clean stop.
+
+    Regression test for silent empty/truncated HTTP 200 streams: the aiohttp
+    transport used to swallow mid-stream connection resets, so the wrapper saw a
+    clean end-of-stream and fabricated finish_reason "stop".
+    """
+    import httpx
+
+    from litellm.exceptions import MidStreamFallbackError
+
+    completion_stream = TransportErrorAfterChunksIterator(
+        model_responses=[_reset_test_chunk(content="Hel")],
+        exception=httpx.ReadError("Response payload is not completed"),
+    )
+    response = CustomStreamWrapper(
+        completion_stream=completion_stream,
+        model="hosted_vllm/stub-model",
+        custom_llm_provider="hosted_vllm",
+        logging_obj=logging_obj,
+    )
+
+    received = []
+    with pytest.raises(MidStreamFallbackError):
+        async for chunk in response:
+            received.append(chunk)
+
+    fabricated_finish_reasons = [
+        chunk.choices[0].finish_reason
+        for chunk in received
+        if chunk.choices and chunk.choices[0].finish_reason
+    ]
+    assert fabricated_finish_reasons == []
